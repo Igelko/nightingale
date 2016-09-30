@@ -1,0 +1,7 @@
+FROM node:5.10
+
+RUN mkdir /app
+COPY {{ appdir }}/ /app/
+COPY environment/install.sh /
+RUN /install.sh
+

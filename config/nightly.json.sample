@@ -1,0 +1,21 @@
+{
+    "dns": "192.168.1.1",
+    "apps": [
+        {
+            "name": "nodejs_sample",
+            "repo": "https://github.com/heroku/node-js-sample",
+            "branch": "master",
+            "mode": "nightly",
+            "docker_template": "node",
+            "port": "5000",
+            "inner_port": "5000"
+        },
+        {
+            "name": "nodejs_sample_release",
+            "repo": "https://github.com/heroku/node-js-sample",
+            "branch": "master",
+            "mode": "release",
+            "docker_template": "node"
+        }
+    ]
+}

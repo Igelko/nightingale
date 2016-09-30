@@ -1,0 +1,12 @@
+{
+    "dns": "192.168.1.1",
+    "apps": [
+        {
+            "name": "nodejs_sample_release",
+            "repo": "https://github.com/heroku/node-js-sample",
+            "branch": "master",
+            "mode": "release",
+            "docker_template": "node"
+        }
+    ]
+}
