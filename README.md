@@ -8,9 +8,9 @@
 
 ## Usage
 
-    ./nightingale.py --help
     usage: nightingale.py [-h] [--config CONFIG] [--envdir ENVDIR]
-                        [--templatedir TEMPLATES] [--savetmp] [--build]
+                        [--templatedir TEMPLATES] [--tries R]
+                        [--retries-delay D] [--savetmp] [--send-mail] [--build]
                         [--rotate N] [--imagedir IMAGEDIR]
                         [applications [applications ...]]
 
@@ -23,7 +23,10 @@
     --envdir ENVDIR       additional environment for docker build
     --templatedir TEMPLATES
                             templates directory for dockerfiles
+    --tries R             max tries of build
+    --retries-delay D     delay in seconds between try loops
     --savetmp             Save temporary directory
+    --send-mail           Send report mail after build
     --build               Build and run new images
     --rotate N            Rotate images older than N days
     --imagedir IMAGEDIR   path to save docker images
@@ -45,6 +48,14 @@ Do a build from config/release.json. And save release mode sections to ./images
 ## Config file format
 
     {
+        "smtp": {
+            "host": "smtp.example.com",
+            "port": 465,
+            "user": "builds-mailer@example.com",
+            "passwd": "SECRET",
+            "fromaddr": "builds-mailer@example.com",
+            "toaddrs": ["dev1@example.com", "pm@example.com"]
+        },
         "dns": "192.168.111.1",                                             # dns server for docker containers.
         "apps": [                                                           # array of apps for build
             {
@@ -59,7 +70,10 @@ Do a build from config/release.json. And save release mode sections to ./images
                 "inner_port": "1345"                                        # Port to expose inside docker container. Used in nigthly mode.
                 "volumes": [                                                # List of volumes to mount. Used in nigthly mode.
                     "/mnt/storage/builds/sap-exchange:/app/exchange:rw"     # Docker -v argument. `<path on host>:<path inside>:<ro|rw>`
-                ]
+                ],
+                "env": {                                                    # Environment variables dictionary for container works for nightly mode.
+                    "TZ": "Europe/Samara"
+                }
             }
         ]
     }

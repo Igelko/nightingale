@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import time
 import shutil
 import logging
 import argparse
@@ -13,6 +14,10 @@ import subprocess
 from itertools import chain, product
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+
+from smtplib import SMTP_SSL as SMTP
+from email.mime.text import MIMEText
+from email.header import Header
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -79,10 +84,7 @@ def save_and_clean_docker_image(tag, imagedir):
         ]), shell=True)
 
 def build(prefix, templates, imagedir, app):
-    if app['mode'] != 'release':
-        image_name = app['name'] + '_' + app['mode']
-    else:
-        image_name = app['name']
+    image_name = app['name']
     path = os.path.join(prefix, image_name)
     # clone repository
     subprocess.check_call([
@@ -150,6 +152,13 @@ def docker_ps():
 
             self.status = status
 
+        def match(self, image_name, port):
+            if self.image != image_name:
+                return False
+            if self.port:
+                return self.port == port
+            return True
+
     cont_out = subprocess.check_output(['docker', 'ps', '-a', '--format', '{{ .ID }} {{ .Image }} {{ .Ports }} {{ .Status }}' ]).decode('utf-8')
     return [Container(*line.split(' ', 4)) for line in cont_out.split('\n') if line]
 
@@ -174,15 +183,18 @@ def run(config, image_id, app):
 
     # remove old similar containers
     for container in containers:
-        if container.image == image_name and ((container.port == app['port']) if container.port else True):
+        if container.match(image_name, app.get('port', None)):
             subprocess.check_call(['docker', 'stop', container.id])
             subprocess.check_call(['docker', 'rm', container.id])
 
-    command = ['docker', 'run', '-d', '--dns=' + config['dns']]
+    command = ['docker', 'run', '-d', '--restart=always', '--dns=' + config['dns']]
 
     if 'port' in app:
         ports = ['-p', '0.0.0.0:' + app['port'] + ':' + app['inner_port'], '--expose=' + app['inner_port']]
         command.extend(ports)
+
+    env = chain(*product(['-e'], ["{}={}".format(*item) for item in app.get('envvars', {}).items()]))
+    command.extend(env)
 
     volumes = chain(*product(['-v'], ['/var/log/' + image_name + ':/var/log:rw'] + app.get('volumes', [])))
     command.extend(volumes)
@@ -210,8 +222,14 @@ def parse_arguments():
         default='./environment', help='additional environment for docker build')
     parser.add_argument('--templatedir', dest='templates',
         default='./templates', help='templates directory for dockerfiles')
+    parser.add_argument('--tries', metavar='R', dest='tries',
+        default=1, type=int, help='max tries of build')
+    parser.add_argument('--retries-delay', metavar='D', dest='retries_delay',
+        default=10, type=int, help='delay in seconds between try loops')
     parser.add_argument('--savetmp', dest='deletetemp',
         default=True, action='store_false', help='Save temporary directory')
+    parser.add_argument('--send-mail', dest='send_mail',
+        default=False, action='store_true', help='Send report mail after build')
     parser.add_argument('--build', dest='build',
         default=False, action='store_true', help='Build and run new images')
     parser.add_argument('--rotate', metavar='N', dest='max_days',
@@ -226,33 +244,89 @@ def get_config(path):
         return json.load(data)
 
 
-def main():
-    options = parse_arguments()
-    config = get_config(options.config) if options.config else {}
-    print(options)
-    print(config)
+def make_a_try(temp, templates, app, config, options):
+    class BuildStatus(object):
+        def __init__(self, success, app, message):
+            self.success = success
+            self.app = app
+            self.message = message
+
+    try:
+        print('Build %s' % app['name'])
+        image_id = build(temp, templates, options.imagedir, app)
+        if app['mode'] == 'nightly':
+            run(config, image_id, app)
+        return BuildStatus(True, app['name'], (image_id.split(':')[1]))
+    except Exception as e:
+        print('!!!!!!!!!!!!!!!!!!!! FAIL! !!!!!!!!!!!!!!!!!!!!!!')
+        print(app['name'])
+        print('Error %s' % e)
+        return BuildStatus(False, app['name'], 'Ошибка сборки!')
+
+
+def process_builds(apps, config, options):
+    build_results = []
     templates = Environment(loader=FileSystemLoader(options.templates))
     with tempdir(delete=options.deletetemp) as temp:
         # copy context
         shutil.copytree(options.envdir, os.path.join(temp, 'environment'))
         if options.build:
-            for app in config['apps']:
-                try:
-                    if not options.applications or app['name'] in options.applications:
-                            image_id = build(temp, templates, options.imagedir, app)
-                            if app['mode'] == 'nightly':
-                                run(config, image_id, app)
-                    else:
-                        print('Skip ', app['name'])
-                except Exception as e:
-                    print('!!!!!!!!!!!!!!!!!!!! FAIL! !!!!!!!!!!!!!!!!!!!!!!')
-                    print(app['name'])
-                    print('Error %s' % e)
-                    raise e
+            print(apps)
+            build_results = [ make_a_try(temp, templates, app, config, options) for app in apps ]
 
         if options.max_days:
             rotate(options.max_days)
 
+    return build_results
+
+def send_mail(host, port, user, passwd, fromaddr, toaddrs, subject, message, encoding='utf-8'):
+    try:
+        msg = MIMEText(message, 'plain', encoding)
+        msg['From'] = Header(fromaddr)
+        msg['Subject'] = Header(subject, encoding)
+        #sends mail.
+        smtp = SMTP(host, port)
+        #smtp.set_debuglevel(True)
+        if user and passwd:
+            smtp.login(user, passwd)
+        smtp.sendmail(fromaddr, toaddrs, msg.as_string())
+        smtp.quit()
+        print('Mail sent successfuly')
+    except Exception as e:
+        print('Error on mail senfing! %s' % repr(e))
+
+
+def compose_mail(build_results):
+    build_status = 'OK' if all(result.success for result in build_results) else 'FAIL'
+    subject = datetime.now().strftime('Nightlty build at %Y-%m-%d %H:%M. {}'.format(build_status))
+    message = '\n'.join('%s - %s' % (result.app, result.message) for result in build_results)
+    return { 'subject': subject, 'message': message }
+
+
+def main():
+    options = parse_arguments()
+    config = get_config(options.config) if options.config else {}
+    print(options)
+    print(config)
+    apps = [ app for app in config['apps'] if app['name'] in options.applications ] \
+        if options.applications \
+        else config['apps']
+
+    for i in range(options.tries):
+        print('Try #%s' % (i + 1))
+        build_results = process_builds(apps, config, options)
+        if build_results and options.send_mail:
+            if 'smtp' not in config:
+                raise Exception('Need smtp section in config file!')
+            mail = compose_mail(build_results)
+            mail.update(config['smtp'])
+            send_mail(**mail)
+        failed_builds = { res.app for res in build_results if not res.success }
+        apps = [ app for app in apps if app['name'] in failed_builds ]
+        if not apps:
+            break
+        time.sleep(options.retries_delay)
 
 if __name__ == '__main__':
     main()
+
