@@ -4,14 +4,16 @@
 
 - python 3.4+
 - Docker 1.9+
-- python-jinja2
+- git 1.0+
+- python-jinja2 2.8+
 
 ## Usage
 
     usage: nightingale.py [-h] [--config CONFIG] [--envdir ENVDIR]
                         [--templatedir TEMPLATES] [--tries R]
-                        [--retries-delay D] [--savetmp] [--send-mail] [--build]
-                        [--rotate N] [--imagedir IMAGEDIR]
+                        [--retries-delay D] [--savetmp] [--verbose]
+                        [--send-mail] [--build] [--rotate N]
+                        [--imagedir IMAGEDIR] [--registry REGISTRIES]
                         [applications [applications ...]]
 
     positional arguments:
@@ -26,10 +28,12 @@
     --tries R             max tries of build
     --retries-delay D     delay in seconds between try loops
     --savetmp             Save temporary directory
+    --verbose             Print logs from docker build
     --send-mail           Send report mail after build
     --build               Build and run new images
     --rotate N            Rotate images older than N days
     --imagedir IMAGEDIR   path to save docker images
+
 
 Samples:
 
@@ -63,6 +67,7 @@ Do a build from config/release.json. And save release mode sections to ./images
                 "repo": "git@gitlab.com:kconcern/aks-monitor-web.git",      # project repo to build
                 "branch": "release",                                        # tag / branch
                 "mode": "release",                                          # mode. "nightly" - build and run on current host or "release" - build and save to --imagedir
+                "version_cmd": "npm version --no-git-tag-version {version}" # template of version set command. mandatory for nightly mode.
                 "docker_template": "node-oracle",                           # template for build.
                 "buildcmd": "npm run build:gulp",                           # additional build command. used for gulp / grunt etc.
                 "builddir": "dist"                                          # directory inside repo folder with built artifacts.
@@ -91,14 +96,14 @@ Mandatory template for releases is a postbuild.j2. It used for initializing para
 2. For each section in `apps`
 
     1. Clone a repo.
-    2. Add a datetime to package version for nightly builds.
+    2. Add a datetime to last version from git tags for nightly builds.
     3. Run `npm install && <buildcmd>` if needed.
     4. Generate `<image_name>.Dockerfile` from `docker_template`
     5. Build docker container with repo directory or `builddir`.
     6. Repack image for releases. Do a `docker save | docker load` and erase all variables from Dockerfile.
     7. Generate and run `postbuild.Dockerfile`. It's a same for all projects.
     8. Tag image `<name>_mode:<version>`
-    9. Save release image to `--imagedir`
+    9. Save image to `--imagedir` if set.
 
     10. For `"nigthly"` sections stop and remove old container with same `name` and `port` (if present) and run built image.
 

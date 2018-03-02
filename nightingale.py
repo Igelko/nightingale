@@ -49,26 +49,34 @@ def docker_container(image):
     finally:
         subprocess.check_call(['docker', 'rm', container])
 
-def make_version(path, mode):
-    with open(os.path.join(path, 'package.json'), 'r+') as package_file:
-        package_json = json.load(package_file)
+def make_version(path, app):
+    version = None
+    with inside_path(path):
+        # try to get latest tag from git
+        try:
+                version = subprocess.check_output(['git', 'describe', '--abbrev=0', '--tags']).decode('utf-8').strip()
+        except subprocess.SubprocessError as e:
+            pass
+
+        # get from config file
+        if version == None:
+            version = app.get('version', '0.0.1')
 
         # add version postfix for nightly builds
-        if mode == 'nightly':
-            package_json['version'] += datetime.now().strftime('-%Y%m%d%H%M')
-            package_file.seek(0)
-            package_file.truncate()
-            json.dump(package_json, package_file, indent=2)
+        if app.get('mode', None) == 'nightly':
+            version += datetime.now().strftime('-%Y%m%d%H%M')
+            set_version_cmd = app.get('version_cmd', None);
+            if set_version_cmd:
+                subprocess.check_call(set_version_cmd.format(version=version), shell=True)
 
-        return package_json['version']
+    return version
 
 def execute_custom_prebuid_cmd(prefix, image_name, path, app):
     with inside_path(path):
-        subprocess.check_call(['npm', 'install'])
         subprocess.check_call(app['buildcmd'], shell=True)
-        shutil.rmtree('node_modules')
         appdir = image_name + '_build'
         shutil.copytree(os.path.join(path, app['builddir']), os.path.join(prefix, appdir))
+    shutil.rmtree(path)
     return appdir
 
 def repack_docker_image(image_id, image_name):
@@ -80,28 +88,37 @@ def repack_docker_image(image_id, image_name):
 
 def save_and_clean_docker_image(tag, imagedir):
     subprocess.check_call(''.join(['docker save ', tag,
-        ' | xz --compress -9 > ', os.path.join(imagedir, tag.replace(':', '_') + '.tar.xz')
+        ' | xz --compress -9 --threads=0 > ', os.path.join(imagedir, tag.replace(':', '_') + '.tar.xz')
         ]), shell=True)
 
-def build(prefix, templates, imagedir, app):
+def push_docker_image(tag, registry_url):
+    remote_tag = '/'.join([registry_url, tag])
+    subprocess.check_call(['docker', 'tag', tag, remote_tag])
+    subprocess.check_call(['docker', 'push', remote_tag])
+
+def build(prefix, templates, app, verbose=False):
     image_name = app['name']
     path = os.path.join(prefix, image_name)
+
     # clone repository
     subprocess.check_call([
         'git', 'clone',
         '--branch', app['branch'],
-        '--depth', '1',
-        '--recursive',
+        # '--depth', '1',
         app['repo'], path
     ])
 
-    version = make_version(path, app.get('mode', None))
+    subdir = app.get('subdir', None)
+    if subdir:
+        path = os.path.join(path, subdir)
+
+    version = make_version(path, app)
 
     # install dependencies and build release files
     if 'buildcmd' in app:
         appdir = execute_custom_prebuid_cmd(prefix, image_name, path, app)
     else:
-        appdir = image_name
+        appdir = os.path.relpath(path, prefix)
 
     # prepare docker template
     tmpl = templates.get_template(app['docker_template'] + '.j2')
@@ -112,7 +129,10 @@ def build(prefix, templates, imagedir, app):
     # build image
     with inside_path(prefix):
         tmp_image_id = image_name + ':tmp'
-        subprocess.check_call(['docker', 'build', '--quiet', '-t', tmp_image_id, '--file', dockerfile_name, '.'])
+        if verbose:
+            subprocess.check_call(['docker', 'build', '-t', tmp_image_id, '--file', dockerfile_name, '.'])
+        else:
+            subprocess.check_call(['docker', 'build', '--quiet', '-t', tmp_image_id, '--file', dockerfile_name, '.'])
 
     # repack and replace release image
     if app['mode'] == 'release':
@@ -131,10 +151,6 @@ def build(prefix, templates, imagedir, app):
 
     # remove temp tag
     subprocess.check_call(['docker', 'rmi', tmp_image_id])
-
-    # save release image
-    if app['mode'] == 'release':
-        save_and_clean_docker_image(tag, imagedir)
 
     return tag
 
@@ -187,7 +203,7 @@ def run(config, image_id, app):
             subprocess.check_call(['docker', 'stop', container.id])
             subprocess.check_call(['docker', 'rm', container.id])
 
-    command = ['docker', 'run', '-d', '--restart=always', '--dns=' + config['dns']]
+    command = ['docker', 'run', '-d', '--restart=always', '--name', image_name, '--dns=' + config['dns']]
 
     if 'port' in app:
         ports = ['-p', '0.0.0.0:' + app['port'] + ':' + app['inner_port'], '--expose=' + app['inner_port']]
@@ -225,16 +241,19 @@ def parse_arguments():
     parser.add_argument('--tries', metavar='R', dest='tries',
         default=1, type=int, help='max tries of build')
     parser.add_argument('--retries-delay', metavar='D', dest='retries_delay',
-        default=10, type=int, help='delay in seconds between try loops')
+        default=0, type=int, help='delay in seconds between try loops')
     parser.add_argument('--savetmp', dest='deletetemp',
         default=True, action='store_false', help='Save temporary directory')
+    parser.add_argument('--verbose', dest='verbose',
+        default=False, action='store_true', help='Print logs from docker build')
     parser.add_argument('--send-mail', dest='send_mail',
         default=False, action='store_true', help='Send report mail after build')
     parser.add_argument('--build', dest='build',
         default=False, action='store_true', help='Build and run new images')
     parser.add_argument('--rotate', metavar='N', dest='max_days',
         default=False, type=int, help='Rotate images older than N days')
-    parser.add_argument('--imagedir', dest='imagedir', default=os.getcwd(), help='path to save docker images')
+    parser.add_argument('--imagedir', dest='imagedir', default='.', help='path to save docker images')
+    parser.add_argument('--registry', dest='registries', action='append', default=[], help='registry url')
     parser.add_argument('applications', nargs='*', help='Limit applications from config to build')
     return parser.parse_args()
 
@@ -245,39 +264,54 @@ def get_config(path):
 
 
 def make_a_try(temp, templates, app, config, options):
-    class BuildStatus(object):
-        def __init__(self, success, app, message):
-            self.success = success
-            self.app = app
-            self.message = message
-
+    d1 = datetime.now()
     try:
         print('Build %s' % app['name'])
-        image_id = build(temp, templates, options.imagedir, app)
+        image_id = build(temp, templates, app, options.verbose)
+
+        # save release image
+        if options.imagedir != '.':
+            save_and_clean_docker_image(image_id, options.imagedir)
+
+        # push image to registries if exists
+        if options.registries:
+            for registry in options.registries:
+                push_docker_image(image_id, registry)
+
         if app['mode'] == 'nightly':
             run(config, image_id, app)
-        return BuildStatus(True, app['name'], (image_id.split(':')[1]))
+
+        success = True
+        message = image_id.split(':')[1]
     except Exception as e:
         print('!!!!!!!!!!!!!!!!!!!! FAIL! !!!!!!!!!!!!!!!!!!!!!!')
         print(app['name'])
         print('Error %s' % e)
-        return BuildStatus(False, app['name'], 'Ошибка сборки!')
+        success = False
+        message = 'Ошибка сборки!'
+    d2 = datetime.now()
+    return { "success": success, "app": app['name'], "message": message, "build_time": str(d2 - d1) }
 
 
 def process_builds(apps, config, options):
     build_results = []
+    failed_apps = []
     templates = Environment(loader=FileSystemLoader(options.templates))
     with tempdir(delete=options.deletetemp) as temp:
         # copy context
         shutil.copytree(options.envdir, os.path.join(temp, 'environment'))
         if options.build:
-            print(apps)
-            build_results = [ make_a_try(temp, templates, app, config, options) for app in apps ]
+            for app in apps:
+                build_result = make_a_try(temp, templates, app, config, options)
+                build_results.append(build_result)
+                if not build_result['success']:
+                    failed_apps.append(app)
 
         if options.max_days:
             rotate(options.max_days)
 
-    return build_results
+    return build_results, failed_apps
+
 
 def send_mail(host, port, user, passwd, fromaddr, toaddrs, subject, message, encoding='utf-8'):
     try:
@@ -297,9 +331,9 @@ def send_mail(host, port, user, passwd, fromaddr, toaddrs, subject, message, enc
 
 
 def compose_mail(build_results):
-    build_status = 'OK' if all(result.success for result in build_results) else 'FAIL'
+    build_status = 'OK' if all(result['success'] for result in build_results) else 'FAIL'
     subject = datetime.now().strftime('Nightlty build at %Y-%m-%d %H:%M. {}'.format(build_status))
-    message = '\n'.join('%s - %s' % (result.app, result.message) for result in build_results)
+    message = '\n'.join('%s - %s - Время сборки: %s' % (result['app'], result['message'], result['build_time']) for result in build_results)
     return { 'subject': subject, 'message': message }
 
 
@@ -314,15 +348,14 @@ def main():
 
     for i in range(options.tries):
         print('Try #%s' % (i + 1))
-        build_results = process_builds(apps, config, options)
+        build_results, apps = process_builds(apps, config, options)
         if build_results and options.send_mail:
             if 'smtp' not in config:
                 raise Exception('Need smtp section in config file!')
             mail = compose_mail(build_results)
             mail.update(config['smtp'])
             send_mail(**mail)
-        failed_builds = { res.app for res in build_results if not res.success }
-        apps = [ app for app in apps if app['name'] in failed_builds ]
+
         if not apps:
             break
         time.sleep(options.retries_delay)

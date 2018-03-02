@@ -6,6 +6,7 @@
             "repo": "https://github.com/heroku/node-js-sample",
             "branch": "master",
             "mode": "nightly",
+            "version_cmd": "npm version --no-git-tag-version {version}",
             "docker_template": "node",
             "port": "5000",
             "inner_port": "5000"
