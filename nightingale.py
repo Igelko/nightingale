@@ -49,12 +49,12 @@ def docker_container(image):
     finally:
         subprocess.check_call(['docker', 'rm', container])
 
-def make_version(path, app):
+def make_version(path, app, nightly_mode):
     version = None
     with inside_path(path):
         # try to get latest tag from git
         try:
-                version = subprocess.check_output(['git', 'describe', '--abbrev=0', '--tags']).decode('utf-8').strip()
+            version = subprocess.check_output(['git', 'describe', '--abbrev=0', '--tags']).decode('utf-8').strip()
         except subprocess.SubprocessError as e:
             pass
 
@@ -63,8 +63,10 @@ def make_version(path, app):
             version = app.get('version', '0.0.1')
 
         # add version postfix for nightly builds
-        if app.get('mode', None) == 'nightly':
+        if nightly_mode:
             version += datetime.now().strftime('-%Y%m%d%H%M')
+            if app['branch'] != 'master':
+                version += '-' + re.sub('[^\w\.]', '-', app['branch'])
             set_version_cmd = app.get('version_cmd', None);
             if set_version_cmd:
                 subprocess.check_call(set_version_cmd.format(version=version), shell=True)
@@ -96,7 +98,7 @@ def push_docker_image(tag, registry_url):
     subprocess.check_call(['docker', 'tag', tag, remote_tag])
     subprocess.check_call(['docker', 'push', remote_tag])
 
-def build(prefix, templates, app, verbose=False):
+def build(prefix, templates, app, verbose=False, no_cache=False, squash=False, nightly_mode=False):
     image_name = app['name']
     path = os.path.join(prefix, image_name)
 
@@ -112,7 +114,7 @@ def build(prefix, templates, app, verbose=False):
     if subdir:
         path = os.path.join(path, subdir)
 
-    version = make_version(path, app)
+    version = make_version(path, app, nightly_mode)
 
     # install dependencies and build release files
     if 'buildcmd' in app:
@@ -129,13 +131,21 @@ def build(prefix, templates, app, verbose=False):
     # build image
     with inside_path(prefix):
         tmp_image_id = image_name + ':tmp'
-        if verbose:
-            subprocess.check_call(['docker', 'build', '-t', tmp_image_id, '--file', dockerfile_name, '.'])
-        else:
-            subprocess.check_call(['docker', 'build', '--quiet', '-t', tmp_image_id, '--file', dockerfile_name, '.'])
+        command = [
+            opt for opt
+            in [
+                'docker', 'build',
+                '-t', tmp_image_id,
+                '--no-cache=true' if no_cache else None,
+                '--quiet' if not verbose else None,
+                '--file', dockerfile_name, '.'
+            ]
+            if opt
+        ]
+        subprocess.check_call(command)
 
     # repack and replace release image
-    if app['mode'] == 'release':
+    if squash:
         flat_image_id = repack_docker_image(tmp_image_id, image_name)
         subprocess.check_call(['docker', 'rmi', tmp_image_id])
         tmp_image_id = flat_image_id
@@ -209,6 +219,10 @@ def run(config, image_id, app):
         ports = ['-p', '0.0.0.0:' + app['port'] + ':' + app['inner_port'], '--expose=' + app['inner_port']]
         command.extend(ports)
 
+    if 'port_forwards' in app:
+        forwards = list(chain(*(['-p', forward] for forward in app['port_forwards'])))
+        command.extend(forwards)
+
     env = chain(*product(['-e'], ["{}={}".format(*item) for item in app.get('envvars', {}).items()]))
     command.extend(env)
 
@@ -254,6 +268,10 @@ def parse_arguments():
         default=False, type=int, help='Rotate images older than N days')
     parser.add_argument('--imagedir', dest='imagedir', default='.', help='path to save docker images')
     parser.add_argument('--registry', dest='registries', action='append', default=[], help='registry url')
+    parser.add_argument('--squash', dest='squash', action='store_true', default=False, help='Repack image - remove all layers')
+    parser.add_argument('--run', dest='run', action='store_true', default=False, help='Try run application after build')
+    parser.add_argument('--nightly', dest='nightly', action='store_true', default=False, help='Nightly mode - add date postfix to version')
+    parser.add_argument('--no-cache', dest='no_cache', action='store_true', default=False, help='Disable docker cache for build')
     parser.add_argument('applications', nargs='*', help='Limit applications from config to build')
     return parser.parse_args()
 
@@ -267,7 +285,7 @@ def make_a_try(temp, templates, app, config, options):
     d1 = datetime.now()
     try:
         print('Build %s' % app['name'])
-        image_id = build(temp, templates, app, options.verbose)
+        image_id = build(temp, templates, app, options.verbose, options.no_cache, options.squash, options.nightly)
 
         # save release image
         if options.imagedir != '.':
@@ -278,7 +296,7 @@ def make_a_try(temp, templates, app, config, options):
             for registry in options.registries:
                 push_docker_image(image_id, registry)
 
-        if app['mode'] == 'nightly':
+        if options.run:
             run(config, image_id, app)
 
         success = True
@@ -330,21 +348,42 @@ def send_mail(host, port, user, passwd, fromaddr, toaddrs, subject, message, enc
         print('Error on mail senfing! %s' % repr(e))
 
 
-def compose_mail(build_results):
+def compose_mail(build_results, config_smtp):
+    mail = dict(config_smtp)
     build_status = 'OK' if all(result['success'] for result in build_results) else 'FAIL'
-    subject = datetime.now().strftime('Nightlty build at %Y-%m-%d %H:%M. {}'.format(build_status))
-    message = '\n'.join('%s - %s - Время сборки: %s' % (result['app'], result['message'], result['build_time']) for result in build_results)
-    return { 'subject': subject, 'message': message }
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+    mail['subject'] = mail.get('subject', '')
+    mail['subject'] += ' at {}. {}'.format(current_time, build_status)
+    mail['message'] = '\n'.join('%s - %s - Время сборки: %s' % (result['app'], result['message'], result['build_time']) for result in build_results)
+    return mail
 
 
 def main():
     options = parse_arguments()
     config = get_config(options.config) if options.config else {}
     print(options)
-    print(config)
-    apps = [ app for app in config['apps'] if app['name'] in options.applications ] \
-        if options.applications \
-        else config['apps']
+#    print(config)
+
+    if not options.applications:
+        apps = config['apps']
+    else:
+        apps = []
+        apps_options = {}
+        for app_option in options.applications:
+            app_def = app_option.split('#')
+            app_name = app_def[0]
+            apps_options[app_name] = {}
+            if len(app_def) == 2:
+                app_branch = app_def[1]
+                apps_options[app_name]['branch'] = app_branch
+
+        for app in config['apps']:
+            if app['name'] in apps_options.keys():
+                app_def = app.copy()
+                app_def.update(apps_options[app['name']])
+                apps.append(app_def)
+
+    print(apps)
 
     for i in range(options.tries):
         print('Try #%s' % (i + 1))
@@ -352,8 +391,7 @@ def main():
         if build_results and options.send_mail:
             if 'smtp' not in config:
                 raise Exception('Need smtp section in config file!')
-            mail = compose_mail(build_results)
-            mail.update(config['smtp'])
+            mail = compose_mail(build_results, config['smtp'])
             send_mail(**mail)
 
         if not apps:
