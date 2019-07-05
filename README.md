@@ -13,7 +13,8 @@
                         [--templatedir TEMPLATES] [--tries R]
                         [--retries-delay D] [--savetmp] [--verbose]
                         [--send-mail] [--build] [--rotate N]
-                        [--imagedir IMAGEDIR] [--registry REGISTRIES]
+                        [--imagedir IMAGEDIR] [--registry REGISTRIES] [--squash]
+                        [--run] [--nightly] [--no-cache]
                         [applications [applications ...]]
 
     positional arguments:
@@ -33,7 +34,12 @@
     --build               Build and run new images
     --rotate N            Rotate images older than N days
     --imagedir IMAGEDIR   path to save docker images
-
+    --registry REGISTRIES
+                            registry url
+    --squash              Repack image - remove all layers
+    --run                 Try run application after build
+    --nightly             Nightly mode - add date postfix to version
+    --no-cache            Disable docker cache for build
 
 Samples:
 
@@ -66,13 +72,15 @@ Do a build from config/release.json. And save release mode sections to ./images
                 "name": "aks_monitor_web",                                  # docker image name
                 "repo": "git@gitlab.com:kconcern/aks-monitor-web.git",      # project repo to build
                 "branch": "release",                                        # tag / branch
-                "mode": "release",                                          # mode. "nightly" - build and run on current host or "release" - build and save to --imagedir
                 "version_cmd": "npm version --no-git-tag-version {version}" # template of version set command. mandatory for nightly mode.
                 "docker_template": "node-oracle",                           # template for build.
                 "buildcmd": "npm run build:gulp",                           # additional build command. used for gulp / grunt etc.
                 "builddir": "dist"                                          # directory inside repo folder with built artifacts.
-                "port": "11345",                                            # External port for listen. Used in nigthly mode.
-                "inner_port": "1345"                                        # Port to expose inside docker container. Used in nigthly mode.
+                "port": "11345",                                            # External port for listen. Used in nigthly mode. DEPRECATED.
+                "inner_port": "1345"                                        # Port to expose inside docker container. Used in nigthly mode. DEPRECATED.
+                "port_forwards": [                                          # New port forwards format.
+                    "0.0.0.0:11345:1345"
+                ],
                 "volumes": [                                                # List of volumes to mount. Used in nigthly mode.
                     "/mnt/storage/builds/sap-exchange:/app/exchange:rw"     # Docker -v argument. `<path on host>:<path inside>:<ro|rw>`
                 ],
